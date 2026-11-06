@@ -1,0 +1,126 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: RoadWatch - citizen pothole reports, AI-verified, ranked and mapped (serverless)
+
+Parameters:
+  ModelId:
+    Type: String
+    Default: apac.amazon.nova-lite-v1:0
+    Description: Bedrock model or inference profile that accepts images. Enable access in the Bedrock console first.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    MemorySize: 256
+    Timeout: 30
+    Environment:
+      Variables:
+        TABLE: !Sub 'roadwatch-reports-${AWS::StackName}'
+        BUCKET: !Sub 'roadwatch-photos-${AWS::AccountId}-${AWS::Region}'
+        MODEL_ID: !Ref ModelId
+
+Resources:
+  PhotoBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: AnalyzeFunctionNewPhotoPermission
+    Properties:
+      BucketName: !Sub 'roadwatch-photos-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [PUT]
+            AllowedOrigins: ['*']
+            AllowedHeaders: ['*']
+            MaxAge: 3000
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-photos
+            Status: Enabled
+            ExpirationInDays: 90
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:Put
+            Function: !GetAtt AnalyzeFunction.Arn
+
+  AnalyzeFunctionNewPhotoPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AnalyzeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub 'arn:aws:s3:::roadwatch-photos-${AWS::AccountId}-${AWS::Region}'
+
+  ReportsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'roadwatch-reports-${AWS::StackName}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: id, AttributeType: S}
+      KeySchema:
+        - {AttributeName: id, KeyType: HASH}
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins: ['*']
+        AllowMethods: [GET, POST, OPTIONS]
+        AllowHeaders: [content-type]
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: api.handler
+      CodeUri: src/
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:PutItem, dynamodb:Scan]
+              Resource: !GetAtt ReportsTable.Arn
+            - Effect: Allow
+              Action: [s3:PutObject]
+              Resource: !Sub 'arn:aws:s3:::roadwatch-photos-${AWS::AccountId}-${AWS::Region}/*'
+      Events:
+        UploadUrl:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: /upload-url, Method: POST}
+        List:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: /reports, Method: GET}
+
+  AnalyzeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: analyze.handler
+      CodeUri: src/
+      Timeout: 60
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:UpdateItem]
+              Resource: !GetAtt ReportsTable.Arn
+            - Effect: Allow
+              Action: [s3:GetObject, s3:DeleteObject]
+              Resource: !Sub 'arn:aws:s3:::roadwatch-photos-${AWS::AccountId}-${AWS::Region}/*'
+            - Effect: Allow
+              Action: [bedrock:InvokeModel]
+              Resource: '*'
+
+Outputs:
+  ApiUrl:
+    Description: Paste this into web/index.html (const API)
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+  PhotoBucketName:
+    Value: !Sub 'roadwatch-photos-${AWS::AccountId}-${AWS::Region}'
