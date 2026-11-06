@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RoadWatch</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+:root{--bg:#10131a;--card:#1a1f2b;--fg:#eef1f6;--mut:#9aa3b5;--acc:#ffb703}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--fg);display:flex;flex-direction:column;height:100vh}
+header{padding:10px 14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:var(--card)}
+header h1{font-size:18px;margin:0;margin-right:auto}
+button,label.btn{background:var(--acc);color:#111;border:0;border-radius:8px;padding:9px 14px;font-size:15px;font-weight:600;cursor:pointer}
+button.alt{background:#2a3142;color:var(--fg)}
+button:disabled{opacity:.5}
+#main{flex:1;display:flex;min-height:0}
+#map{flex:1}
+#side{width:300px;overflow:auto;background:var(--card);padding:10px;display:none}
+.row{padding:8px;border-radius:8px;background:#232a3a;margin-bottom:8px;font-size:14px;cursor:pointer}
+.row small{color:var(--mut)}
+#msg{width:100%;font-size:14px;color:var(--mut)}
+.legend{position:absolute;z-index:500;right:10px;bottom:24px;background:#000a;color:#fff;padding:6px 10px;border-radius:8px;font-size:12px}
+@media(min-width:800px){#side{display:block}}
+</style>
+</head>
+<body>
+<header>
+  <h1>RoadWatch</h1>
+  <label class="btn" for="photo">Take photo</label>
+  <input id="photo" type="file" accept="image/*" capture="environment" hidden>
+  <button id="send" disabled>Report here</button>
+  <button class="alt" id="csv">Export CSV</button>
+  <div id="msg">Take a photo of the pothole, then tap Report.</div>
+</header>
+<div id="main">
+  <div id="map" style="position:relative"><div class="legend">Severity: 1 low &rarr; 5 high</div></div>
+  <aside id="side"><b>Worst first</b><div id="list" style="margin-top:8px"></div></aside>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const API = "PASTE_YOUR_ApiUrl_OUTPUT_HERE";
+const COLORS = ["", "#2e9e4f", "#9ec12e", "#f0b400", "#ee7a00", "#d62020"];
+const msg = t => document.getElementById("msg").textContent = t;
+const map = L.map("map").setView([12.9716, 77.5946], 12);
+L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {attribution: "&copy; OpenStreetMap"}).addTo(map);
+const layer = L.layerGroup().addTo(map);
+let rows = [], blob = null;
+
+function esc(s){ return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+async function load() {
+  try {
+    rows = await (await fetch(API + "/reports")).json();
+  } catch (e) { msg("Could not load reports"); return; }
+  layer.clearLayers();
+  const list = document.getElementById("list"); list.innerHTML = "";
+  rows.forEach(r => {
+    const m = L.circleMarker([+r.lat, +r.lng], {radius: 6 + 2 * r.severity, color: COLORS[r.severity], fillOpacity: .7})
+      .addTo(layer).bindPopup(`Severity ${esc(r.severity)}/5<br>Two-wheeler risk: ${esc(r.hazard)}<br>${esc(r.reason)}`);
+    const d = document.createElement("div"); d.className = "row";
+    d.innerHTML = `<b style="color:${COLORS[r.severity]}">Severity ${esc(r.severity)}</b> &middot; ${esc(r.hazard)} risk<br><small>${esc(r.reason)}</small>`;
+    d.onclick = () => { map.setView([+r.lat, +r.lng], 17); m.openPopup(); };
+    list.appendChild(d);
+  });
+}
+
+// Shrink the photo to a ~1200px JPEG: faster upload, and always the format the API expects.
+function toJpeg(file) {
+  return new Promise((ok, bad) => {
+    const img = new Image();
+    img.onload = () => {
+      const s = Math.min(1, 1200 / Math.max(img.width, img.height));
+      const c = document.createElement("canvas");
+      c.width = Math.round(img.width * s); c.height = Math.round(img.height * s);
+      c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+      c.toBlob(b => b ? ok(b) : bad(new Error("encode failed")), "image/jpeg", 0.85);
+    };
+    img.onerror = () => bad(new Error("unreadable image"));
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+document.getElementById("photo").onchange = async e => {
+  const f = e.target.files[0]; if (!f) return;
+  try { blob = await toJpeg(f); document.getElementById("send").disabled = false; msg("Photo ready. Stand at the pothole and tap Report."); }
+  catch (err) { msg("Could not read that photo"); }
+};
+
+document.getElementById("send").onclick = () => {
+  const btn = document.getElementById("send"); btn.disabled = true; msg("Getting location...");
+  navigator.geolocation.getCurrentPosition(async p => {
+    try {
+      const r = await fetch(API + "/upload-url", {method: "POST", body: JSON.stringify({lat: p.coords.latitude, lng: p.coords.longitude})});
+      if (!r.ok) throw new Error("api " + r.status);
+      const {uploadUrl} = await r.json();
+      const u = await fetch(uploadUrl, {method: "PUT", headers: {"Content-Type": "image/jpeg"}, body: blob});
+      if (!u.ok) throw new Error("upload " + u.status);
+      msg("Sent. It appears on the map after AI verification (a few seconds).");
+      blob = null; setTimeout(load, 8000);
+    } catch (err) { msg("Upload failed: " + err.message); btn.disabled = false; }
+  }, () => { msg("Location permission is needed."); btn.disabled = false; }, {enableHighAccuracy: true, timeout: 15000});
+};
+
+document.getElementById("csv").onclick = () => {
+  const head = "id,lat,lng,severity,hazard,reason,created";
+  const body = rows.map(r => [r.id, r.lat, r.lng, r.severity, r.hazard, JSON.stringify(r.reason || ""), r.created].join(","));
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([[head, ...body].join("\n")], {type: "text/csv"}));
+  a.download = "roadwatch-reports.csv"; a.click();
+};
+
+load(); setInterval(load, 60000);
+</script>
+</body>
+</html>
